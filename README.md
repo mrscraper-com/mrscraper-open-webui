@@ -2,7 +2,7 @@
 
 Give [Open WebUI](https://openwebui.com) models live web data from
 [MrScraper](https://mrscraper.com): retrieve public pages as Markdown or HTML,
-search Google, and check your MrScraper plan and token usage.
+search the web, and check your MrScraper plan and token usage.
 
 There are two ways to connect. Use the MCP server if you are an Open WebUI
 admin on v0.6.31 or later; use the community tool otherwise.
@@ -35,7 +35,7 @@ The server provides `scraperAPI`, `webSearch`, and `status`. See the
 | Function | What it does |
 | --- | --- |
 | `scrape_page` | Retrieves a public page as Markdown (default) or HTML. Long pages are cut at `max_characters` (Valve, default 100,000; 0 disables). |
-| `web_search` | Searches Google and returns organic results (rank, title, link, description, source) and the next page number. |
+| `web_search` | Searches the web and returns organic results (rank, title, link, description, source) and the next page number. |
 | `account_status` | Shows the subscription status, token limit, tokens used, and tokens remaining. Uses no tokens. |
 
 Errors are reported to the model as short messages with the HTTP status; the
