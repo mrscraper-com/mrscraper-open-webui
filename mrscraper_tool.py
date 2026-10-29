@@ -3,10 +3,10 @@ title: MrScraper
 author: MrScraper
 author_url: https://mrscraper.com
 git_url: https://github.com/mrscraper-com/mrscraper-open-webui
-description: Retrieve public web pages as Markdown or HTML, search Google, and check MrScraper account usage.
+description: Retrieve public web pages as Markdown or HTML, search the web, and check MrScraper account usage.
 required_open_webui_version: 0.6.0
 requirements: mrscraper-sdk>=0.6.0
-version: 0.1.0
+version: 0.1.1
 licence: MIT
 """
 
@@ -104,13 +104,13 @@ class Tools:
         __event_emitter__: EventEmitter = None,
     ) -> str:
         """
-        Search Google through MrScraper and return the organic results as JSON (rank, title, link, description, source). Use it to find pages when no URL is known, then read chosen pages with scrape_page. Each call uses MrScraper plan tokens.
-        :param query: Search terms, or a complete Google search URL.
+        Search the web through MrScraper and return the organic results as JSON (rank, title, link, description, source). Use it to find pages when no URL is known, then read chosen pages with scrape_page. Each call uses MrScraper plan tokens.
+        :param query: Search terms, or a complete search results URL.
         :param region: Optional two-letter country code for the results, such as us, gb, or id.
         :param language: Optional language code for the results, such as en or id.
         :param page: One-based result page.
         """
-        await _status(__event_emitter__, f"Searching Google for {query}", False)
+        await _status(__event_emitter__, f"Searching the web for {query}", False)
         try:
             response = await self._client().web_search(
                 query,
