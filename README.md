@@ -35,7 +35,7 @@ The server provides `scraperAPI`, `webSearch`, and `status`. See the
 | Function | What it does |
 | --- | --- |
 | `scrape_page` | Retrieves a public page as Markdown (default) or HTML. Long pages are cut at `max_characters` (Valve, default 100,000; 0 disables). |
-| `web_search` | Searches the web and returns organic results (rank, title, link, description, source) and the next page number. |
+| `web_search` | Searches the web and returns ranked results (rank, title, link, description, source). Options: `region` (two-letter country, default us) and `num_results` (10 to 100, default 10). |
 | `account_status` | Shows the subscription status, token limit, tokens used, and tokens remaining. Uses no tokens. |
 
 Errors are reported to the model as short messages with the HTTP status; the
