@@ -4,7 +4,7 @@ author: MrScraper
 author_url: https://mrscraper.com
 git_url: https://github.com/mrscraper-com/mrscraper-open-webui
 description: Retrieve public web pages as Markdown or HTML, search the web, and check MrScraper account usage.
-required_open_webui_version: 0.6.0
+required_open_webui_version: 0.6.11
 version: 0.3.0
 licence: MIT
 """
@@ -279,6 +279,43 @@ async def _request(
     return {"status_code": response.status_code, "data": data, "headers": safe_headers}
 
 
+async def _send(
+    valves: Any,
+    emitter: EventEmitter,
+    label: str,
+    url: str,
+    deadline: int,
+    method: str = "GET",
+    body: Optional[dict[str, Any]] = None,
+    headers: Optional[dict[str, str]] = None,
+    sanitize: bool = True,
+) -> str:
+    """Calls MrScraper with the Valves' API key and returns the envelope as JSON text for the model."""
+    api_key = re.sub(r"^bearer\s+", "", valves.api_key.strip(), flags=re.I).strip()
+    if not api_key:
+        raise ValueError(f"MrScraper API key is not set. {KEY_HELP}")
+    await _emit_status(emitter, label, False)
+    result = await _request(
+        method,
+        url,
+        {**(headers or {}), **_auth_headers(api_key)},
+        deadline,
+        body=body,
+        sanitize=sanitize,
+    )
+    outcome = f"{label} failed: {result['error']}" if "error" in result else label
+    await _emit_status(emitter, outcome, True)
+    text = json.dumps(result, ensure_ascii=False, indent=2)
+    limit = valves.max_characters
+    if 0 < limit < len(text):
+        return (
+            f"{text[:limit]}\n\n[Truncated to {limit} characters; raise max_characters"
+            " in the tool's Valves to get more.]"
+        )
+    return text
+
+
+# Open WebUI turns every method of Tools into a tool (before 0.9, "_" methods too), so helpers live outside it.
 class Tools:
     class Valves(BaseModel):
         api_key: str = Field(
@@ -293,43 +330,10 @@ class Tools:
     def __init__(self) -> None:
         self.valves = self.Valves()
 
-    async def _send(
-        self,
-        emitter: EventEmitter,
-        label: str,
-        url: str,
-        deadline: int,
-        method: str = "GET",
-        body: Optional[dict[str, Any]] = None,
-        headers: Optional[dict[str, str]] = None,
-        sanitize: bool = True,
-    ) -> str:
-        api_key = re.sub(r"^bearer\s+", "", self.valves.api_key.strip(), flags=re.I).strip()
-        if not api_key:
-            raise ValueError(f"MrScraper API key is not set. {KEY_HELP}")
-        await _emit_status(emitter, label, False)
-        result = await _request(
-            method,
-            url,
-            {**(headers or {}), **_auth_headers(api_key)},
-            deadline,
-            body=body,
-            sanitize=sanitize,
-        )
-        outcome = f"{label} failed: {result['error']}" if "error" in result else label
-        await _emit_status(emitter, outcome, True)
-        text = json.dumps(result, ensure_ascii=False, indent=2)
-        limit = self.valves.max_characters
-        if 0 < limit < len(text):
-            return (
-                f"{text[:limit]}\n\n[Truncated to {limit} characters; raise max_characters"
-                " in the tool's Valves to get more.]"
-            )
-        return text
-
     async def status(self, __event_emitter__: EventEmitter = None) -> str:
         """Return the raw account status API response without summarizing, redacting body fields, or adding calculated fields."""
-        return await self._send(
+        return await _send(
+            self.valves,
             __event_emitter__,
             "Account Status",
             ACCOUNT_URL,
@@ -391,7 +395,8 @@ class Tools:
             "markdown": False,
             "screenshot": False,
         }
-        return await self._send(
+        return await _send(
+            self.valves,
             __event_emitter__,
             f"Scrape HTML: {url}",
             _endpoint(params),
@@ -455,7 +460,8 @@ class Tools:
             "markdown": True,
             "screenshot": False,
         }
-        return await self._send(
+        return await _send(
+            self.valves,
             __event_emitter__,
             f"Scrape Markdown: {url}",
             _endpoint(params),
@@ -518,7 +524,8 @@ class Tools:
             "html": _boolean("html", html),
             "markdown": _boolean("markdown", markdown),
         }
-        return await self._send(
+        return await _send(
+            self.valves,
             __event_emitter__,
             f"Get Screenshot: {url}",
             _endpoint(params),
@@ -532,8 +539,8 @@ class Tools:
         :param url: Absolute HTTP or HTTPS URL of the page to process.
         """
         params = {"action": "brand-scraping", "url": _page_url(url), "bundle": "none"}
-        return await self._send(
-            __event_emitter__, f"Scrape Brand: {url}", _endpoint(params), 120
+        return await _send(
+            self.valves, __event_emitter__, f"Scrape Brand: {url}", _endpoint(params), 120
         )
 
     async def scrape_json(
@@ -591,10 +598,11 @@ class Tools:
         deadline = params["timeout"] + 30
         get_url = _endpoint(params)
         if len(get_url) <= MAX_GET_URL_LENGTH:
-            return await self._send(__event_emitter__, label, get_url, deadline)
+            return await _send(self.valves, __event_emitter__, label, get_url, deadline)
         # Too long for GET: url, prompt, and agent move to a POST body; page controls stay in the query.
         body = {key: params.pop(key) for key in ("url", "prompt", "agent")}
-        return await self._send(
+        return await _send(
+            self.valves,
             __event_emitter__,
             label,
             _endpoint(params),
@@ -624,6 +632,6 @@ class Tools:
             "country": _country("country", country),
             "numResults": _integer("num_results", num_results, 10, 100),
         }
-        return await self._send(
-            __event_emitter__, f"Web Search: {query}", _endpoint(params), 120
+        return await _send(
+            self.valves, __event_emitter__, f"Web Search: {query}", _endpoint(params), 120
         )

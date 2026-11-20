@@ -26,7 +26,7 @@ connections made before MCP server 0.5.0 must sign in again and approve
 `scraper:read`. See the
 [MCP server documentation](https://docs.mrscraper.com/docs/getting-started/mcp-server).
 
-## Option 2: Community tool
+## Option 2: Community tool (Open WebUI 0.6.11+)
 
 1. Open **Workspace → Tools** and click **+** (or import the tool from the
    Open WebUI community site).
