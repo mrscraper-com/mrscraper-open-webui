@@ -22,8 +22,8 @@ admin on v0.6.31 or later; use the community tool otherwise.
 
 The server provides seven tools: `status`, `scrapeHtml`, `scrapeMarkdown`,
 `getScreenshot`, `scrapeBrand`, `scrapeJson`, and `webSearch`. OAuth
-connections made before MCP server 0.5.0 must sign in again and approve
-`scraper:read`. See the
+connections need `scrape:read` for the six scraping and search tools and
+`account:read` for `status`. See the
 [MCP server documentation](https://docs.mrscraper.com/docs/getting-started/mcp-server).
 
 ## Option 2: Community tool (Open WebUI 0.6.11+)
