@@ -5,28 +5,32 @@ author_url: https://mrscraper.com
 git_url: https://github.com/mrscraper-com/mrscraper-open-webui
 description: Retrieve public web pages as Markdown or HTML, search the web, and check MrScraper account usage.
 required_open_webui_version: 0.6.11
-version: 0.3.0
+version: 0.4.0
 licence: MIT
 """
 
 import asyncio
 import json
 import re
-from typing import Any, Awaitable, Callable, Literal, Optional
+from typing import Any, Awaitable, Callable, Optional
 from urllib.parse import quote_plus, urlsplit
 
 import httpx
 from pydantic import BaseModel, Field
 
 EventEmitter = Optional[Callable[[dict], Awaitable[None]]]
-WaitUntil = Literal["domcontentloaded", "load", "networkidle0", "networkidle2"]
 
-# Requests match MrScraper MCP server 0.5.0 (src/api.ts and src/http.ts).
+# Inputs follow MrScraper's API docs and integration parameter spec, like MrScraper MCP server 0.6.0:
+# an optional parameter left as None is not sent, so the API's default applies. Headers, deadlines,
+# and the response envelope match the MCP server's src/http.ts.
 SCRAPER_API_URL = "https://api.mrscraper.com/"
 ACCOUNT_URL = "https://api.app.mrscraper.com/api/v1/subscription-accounts"
-DEFAULT_JSON_PROMPT = "Extract all data as complete as possible."
 MAX_GET_URL_LENGTH = 8000
 MAX_SAFE_INTEGER = 2**53 - 1
+MAX_AGE_MS = 604_800_000
+# The page timeout the API applies when none is set; the HTTP deadline adds 30 seconds.
+DEFAULT_PAGE_TIMEOUT = 300
+SCREENSHOT_AREA = re.compile(r"full|top|([0-9]{3,4})x([0-9]{3,4})(?:-([0-9]{2,3}))?")
 KEY_HELP = "Set api_key in this tool's Valves to a key from https://app.mrscraper.com/api-tokens."
 
 # Response headers that carry credentials or internal routing details.
@@ -85,28 +89,70 @@ async def _emit_status(emitter: EventEmitter, description: str, done: bool) -> N
         )
 
 
-def _integer(name: str, value: Any, minimum: int, maximum: int = MAX_SAFE_INTEGER) -> int:
+# Each validator returns `default` for None (a parameter the model left unset) and raises
+# ValueError for an invalid value, before any request is sent.
+def _integer(
+    name: str,
+    value: Any,
+    minimum: int,
+    maximum: int = MAX_SAFE_INTEGER,
+    default: Optional[int] = None,
+) -> Optional[int]:
+    if value is None:
+        return default
     if isinstance(value, bool) or not isinstance(value, int) or not minimum <= value <= maximum:
         raise ValueError(f"{name} must be an integer from {minimum} to {maximum}")
     return value
 
 
-def _boolean(name: str, value: Any) -> bool:
+def _boolean(name: str, value: Any, default: Optional[bool] = None) -> Optional[bool]:
+    if value is None:
+        return default
     if not isinstance(value, bool):
         raise ValueError(f"{name} must be a boolean")
     return value
 
 
-def _text(name: str, value: Any) -> str:
-    if not isinstance(value, str) or not value.strip():
+def _text(name: str, value: Any, maximum: Optional[int] = None) -> Optional[str]:
+    """A non-blank string, trimmed, with at most `maximum` characters."""
+    if value is None:
+        return None
+    text = value.strip() if isinstance(value, str) else ""
+    if not text:
         raise ValueError(f"{name} must be a non-empty string")
-    return value.strip()
+    if maximum is not None and len(text) > maximum:
+        raise ValueError(f"{name} must be at most {maximum} characters")
+    return text
 
 
-def _country(name: str, value: Any) -> str:
+def _country(name: str, value: Any) -> Optional[str]:
+    if value is None:
+        return None
     if not isinstance(value, str) or not re.fullmatch(r"[A-Za-z]{2}", value):
         raise ValueError(f"{name} must be a two-letter country code")
     return value.lower()
+
+
+def _screenshot(value: Any, default: Optional[str] = None) -> Optional[str]:
+    """full, top, or <width>x<height> (100 to 3840) with an optional -<zoom> (25 to 300)."""
+    if value is None:
+        return default
+    match = SCREENSHOT_AREA.fullmatch(value) if isinstance(value, str) else None
+    width, height, zoom = match.groups() if match else (None, None, None)
+    valid = match is not None and (
+        width is None
+        or (
+            100 <= int(width) <= 3840
+            and 100 <= int(height) <= 3840
+            and (zoom is None or 25 <= int(zoom) <= 300)
+        )
+    )
+    if not valid:
+        raise ValueError(
+            "screenshot must be full, top, or <width>x<height> with an optional -<zoom>,"
+            " such as 1280x800 or 1920x1080-75 (width and height 100 to 3840, zoom 25 to 300)"
+        )
+    return value
 
 
 def _page_url(value: Any) -> str:
@@ -120,49 +166,8 @@ def _page_url(value: Any) -> str:
     return value
 
 
-def _page_params(
-    url: Any,
-    timeout: Any,
-    geo_code: Any,
-    proxy_country: Any,
-    super_routing: Any,
-    wait_until: Any,
-    proxy: Any,
-    max_retries: Any,
-    save_result: Any,
-) -> dict[str, Any]:
-    """Page controls shared by HTML, Markdown, screenshots, and JSON extraction."""
-    if wait_until not in ("domcontentloaded", "load", "networkidle0", "networkidle2"):
-        raise ValueError(
-            "wait_until must be domcontentloaded, load, networkidle0, or networkidle2"
-        )
-    params = {
-        "url": _page_url(url),
-        "timeout": _integer("timeout", timeout, 1, 300),
-        "geoCode": _country("geo_code", geo_code),
-        "proxyCountry": _country("proxy_country", proxy_country),
-        "super": _boolean("super", super_routing),
-        "waitUntil": wait_until,
-        "saveResult": _boolean("save_result", save_result),
-    }
-    if proxy is not None:
-        params["proxy"] = _text("proxy", proxy)
-    if max_retries is not None:
-        params["maxRetries"] = _integer("max_retries", max_retries, 0)
-    return params
-
-
-def _loading_params(
-    block_resources: Any, wait_for_selector: Any, return_cookie: Any
-) -> dict[str, Any]:
-    """Loading controls shared by HTML, Markdown, and screenshots."""
-    params = {
-        "blockResources": _boolean("block_resources", block_resources),
-        "returnCookie": _boolean("return_cookie", return_cookie),
-    }
-    if wait_for_selector is not None:
-        params["waitForSelector"] = _text("wait_for_selector", wait_for_selector)
-    return params
+def _page_deadline(timeout: Optional[int]) -> int:
+    return (DEFAULT_PAGE_TIMEOUT if timeout is None else timeout) + 30
 
 
 def _form(value: Any) -> str:
@@ -172,7 +177,10 @@ def _form(value: Any) -> str:
 
 
 def _endpoint(params: dict[str, Any]) -> str:
-    query = "&".join(f"{_form(key)}={_form(value)}" for key, value in params.items())
+    """The Scraper API URL with the set values in order; None values are left out."""
+    query = "&".join(
+        f"{_form(key)}={_form(value)}" for key, value in params.items() if value is not None
+    )
     return f"{SCRAPER_API_URL}?{query}"
 
 
@@ -345,198 +353,148 @@ class Tools:
     async def scrape_html(
         self,
         url: str,
-        timeout: int = 300,
-        geo_code: str = "us",
-        proxy_country: str = "us",
-        super: bool = False,
-        wait_until: WaitUntil = "domcontentloaded",
-        proxy: Optional[str] = None,
-        max_retries: Optional[int] = None,
-        save_result: bool = False,
-        block_resources: bool = False,
+        browser_rendering: Optional[bool] = None,
+        timeout: Optional[int] = None,
+        warm_start: Optional[bool] = None,
+        block_resources: Optional[bool] = None,
         wait_for_selector: Optional[str] = None,
-        return_cookie: bool = False,
-        browser_rendering: bool = False,
-        warm_start: bool = False,
+        geo_code: Optional[str] = None,
+        max_age: int = 0,
+        max_retries: Optional[int] = None,
+        screenshot: Optional[str] = None,
         __event_emitter__: EventEmitter = None,
     ) -> str:
-        """Retrieve the raw HTML of a page. Browser rendering is optional.
-        :param url: Absolute HTTP or HTTPS URL of the page to process.
-        :param timeout: Page load timeout in seconds, from 1 to 300. The HTTP request allows 30 additional seconds.
-        :param geo_code: Two-letter country code to load the page from, sent in lowercase.
-        :param proxy_country: Two-letter country code of the proxy server, sent in lowercase.
-        :param super: Whether to route the request through real devices.
-        :param wait_until: Navigation completion event to wait for: domcontentloaded, load, networkidle0, or networkidle2.
-        :param proxy: Custom proxy URL used to load the page.
-        :param max_retries: Maximum number of retries, as a nonnegative integer. Omit this parameter for no limit.
-        :param save_result: Whether to save the result to the dashboard Result tab.
-        :param block_resources: Whether to block images, fonts, and stylesheets while loading the page.
-        :param wait_for_selector: Wait for the page to contain the specified CSS selector before returning the result.
-        :param return_cookie: Whether to include browser session cookies in the response.
-        :param browser_rendering: Whether to render the page in a browser before returning the result.
-        :param warm_start: Whether to enable warm start for more reliable scraping, at the cost of additional latency.
+        """Retrieve the raw HTML of a page. Browser rendering and a screenshot are optional.
+        :param url: URL of the page to scrape. Must include the protocol (https://).
+        :param browser_rendering: Controls whether the page is loaded in a browser. Leave it out to load the page without a browser first and switch to a browser automatically if the request is blocked. Set true to always load the page in a browser, which JavaScript-heavy sites, SPAs, and pages that load content dynamically need. Set false to never use a browser.
+        :param timeout: Maximum seconds to wait for the scrape before the request times out, from 1 to 330. Increase for slow or complex pages. Defaults to 300.
+        :param warm_start: Opens the site's home page first to warm the session before loading the target URL. Useful for sites that expect a normal browsing session before deeper pages.
+        :param block_resources: Blocks images, fonts, and stylesheets from loading. Speeds up scraping and reduces bandwidth usage.
+        :param wait_for_selector: Waits until a specific CSS selector or text appears on the page before returning it, such as #results. Up to 500 characters. Useful for content that loads asynchronously after the initial page load.
+        :param geo_code: Two-letter country code to load the page from, such as us or gb. Defaults to the United States.
+        :param max_age: Serves a cached result of the same request when it is newer than this age, in milliseconds, such as 86400000 for 1 day. Up to 604800000 (7 days). 0, the default, always scrapes fresh. A cached result costs the same tokens as the original scrape.
+        :param max_retries: Maximum number of retries for the request. Omit for no limit.
+        :param screenshot: Also captures a screenshot of the rendered page as a base64-encoded PNG: full captures the entire scroll height, top captures the first viewport, and <width>x<height> sets the viewport size in pixels with an optional -<zoom> percent, such as 1280x800 or 1920x1080-75. Width and height range from 100 to 3840, zoom from 25 to 300. Setting it forces browser rendering. Leave it out for no screenshot.
         """
+        timeout = _integer("timeout", timeout, 1, 330)
         params = {
-            **_page_params(
-                url,
-                timeout,
-                geo_code,
-                proxy_country,
-                super,
-                wait_until,
-                proxy,
-                max_retries,
-                save_result,
-            ),
-            **_loading_params(block_resources, wait_for_selector, return_cookie),
+            "url": _page_url(url),
             "browserRendering": _boolean("browser_rendering", browser_rendering),
+            "timeout": timeout,
             "warmStart": _boolean("warm_start", warm_start),
+            "blockResources": _boolean("block_resources", block_resources),
+            "waitForSelector": _text("wait_for_selector", wait_for_selector, 500),
+            "geoCode": _country("geo_code", geo_code),
+            "maxAge": _integer("max_age", max_age, 0, MAX_AGE_MS, default=0),
+            "maxRetries": _integer("max_retries", max_retries, 0),
+            "screenshot": _screenshot(screenshot),
             "html": True,
             "markdown": False,
-            "screenshot": False,
+            "saveResult": True,
         }
         return await _send(
             self.valves,
             __event_emitter__,
             f"Scrape HTML: {url}",
             _endpoint(params),
-            params["timeout"] + 30,
+            _page_deadline(timeout),
         )
 
     async def scrape_markdown(
         self,
         url: str,
-        timeout: int = 300,
-        geo_code: str = "us",
-        proxy_country: str = "us",
-        super: bool = False,
-        wait_until: WaitUntil = "domcontentloaded",
-        proxy: Optional[str] = None,
-        max_retries: Optional[int] = None,
-        save_result: bool = False,
-        block_resources: bool = False,
+        browser_rendering: Optional[bool] = None,
+        timeout: Optional[int] = None,
+        geo_code: Optional[str] = None,
+        warm_start: Optional[bool] = None,
+        block_resources: Optional[bool] = None,
         wait_for_selector: Optional[str] = None,
-        return_cookie: bool = False,
-        browser_rendering: bool = False,
-        warm_start: bool = False,
-        html: bool = False,
+        max_age: int = 0,
+        max_retries: Optional[int] = None,
         __event_emitter__: EventEmitter = None,
     ) -> str:
-        """Retrieve a page as Markdown. Including HTML also enables browser rendering and returns both outputs as JSON.
-        :param url: Absolute HTTP or HTTPS URL of the page to process.
-        :param timeout: Page load timeout in seconds, from 1 to 300. The HTTP request allows 30 additional seconds.
-        :param geo_code: Two-letter country code to load the page from, sent in lowercase.
-        :param proxy_country: Two-letter country code of the proxy server, sent in lowercase.
-        :param super: Whether to route the request through real devices.
-        :param wait_until: Navigation completion event to wait for: domcontentloaded, load, networkidle0, or networkidle2.
-        :param proxy: Custom proxy URL used to load the page.
-        :param max_retries: Maximum number of retries, as a nonnegative integer. Omit this parameter for no limit.
-        :param save_result: Whether to save the result to the dashboard Result tab.
-        :param block_resources: Whether to block images, fonts, and stylesheets while loading the page.
-        :param wait_for_selector: Wait for the page to contain the specified CSS selector before returning the result.
-        :param return_cookie: Whether to include browser session cookies in the response.
-        :param browser_rendering: Whether to render the page in a browser before returning the result.
-        :param warm_start: Whether to enable warm start for more reliable scraping, at the cost of additional latency.
-        :param html: Whether to include the page HTML in the response.
+        """Retrieve a page as Markdown. Browser rendering is optional.
+        :param url: URL of the page to scrape. Must include the protocol (https://).
+        :param browser_rendering: Controls whether the page is loaded in a browser. Leave it out to load the page without a browser first and switch to a browser automatically if the request is blocked. Set true to always load the page in a browser, which JavaScript-heavy sites, SPAs, and pages that load content dynamically need. Set false to never use a browser.
+        :param timeout: Maximum seconds to wait for the scrape before the request times out, from 1 to 330. Increase for slow or complex pages. Defaults to 300.
+        :param geo_code: Two-letter country code to load the page from, such as us or gb. Defaults to the United States.
+        :param warm_start: Opens the site's home page first to warm the session before loading the target URL. Useful for sites that expect a normal browsing session before deeper pages.
+        :param block_resources: Blocks images, fonts, and stylesheets from loading. Speeds up scraping and reduces bandwidth usage.
+        :param wait_for_selector: Waits until a specific CSS selector or text appears on the page before returning it, such as #results. Up to 500 characters. Useful for content that loads asynchronously after the initial page load.
+        :param max_age: Serves a cached result of the same request when it is newer than this age, in milliseconds, such as 86400000 for 1 day. Up to 604800000 (7 days). 0, the default, always scrapes fresh. A cached result costs the same tokens as the original scrape.
+        :param max_retries: Maximum number of retries for the request. Omit for no limit.
         """
-        html = _boolean("html", html)
-        browser_rendering = _boolean("browser_rendering", browser_rendering)
+        timeout = _integer("timeout", timeout, 1, 330)
         params = {
-            **_page_params(
-                url,
-                timeout,
-                geo_code,
-                proxy_country,
-                super,
-                wait_until,
-                proxy,
-                max_retries,
-                save_result,
-            ),
-            **_loading_params(block_resources, wait_for_selector, return_cookie),
-            "browserRendering": html or browser_rendering,
+            "url": _page_url(url),
+            "browserRendering": _boolean("browser_rendering", browser_rendering),
+            "timeout": timeout,
+            "geoCode": _country("geo_code", geo_code),
             "warmStart": _boolean("warm_start", warm_start),
-            "html": html,
+            "blockResources": _boolean("block_resources", block_resources),
+            "waitForSelector": _text("wait_for_selector", wait_for_selector, 500),
+            "maxAge": _integer("max_age", max_age, 0, MAX_AGE_MS, default=0),
+            "maxRetries": _integer("max_retries", max_retries, 0),
             "markdown": True,
+            "html": False,
             "screenshot": False,
+            "saveResult": True,
         }
         return await _send(
             self.valves,
             __event_emitter__,
             f"Scrape Markdown: {url}",
             _endpoint(params),
-            params["timeout"] + 30,
+            _page_deadline(timeout),
         )
 
     async def get_screenshot(
         self,
         url: str,
-        timeout: int = 300,
-        geo_code: str = "us",
-        proxy_country: str = "us",
-        super: bool = False,
-        wait_until: WaitUntil = "domcontentloaded",
-        proxy: Optional[str] = None,
-        max_retries: Optional[int] = None,
-        save_result: bool = False,
-        block_resources: bool = False,
+        screenshot: str = "full",
+        timeout: Optional[int] = None,
+        geo_code: Optional[str] = None,
         wait_for_selector: Optional[str] = None,
-        return_cookie: bool = False,
-        screenshot: Literal["full", "top"] = "full",
-        html: bool = True,
-        markdown: bool = False,
+        max_age: int = 0,
+        max_retries: Optional[int] = None,
         __event_emitter__: EventEmitter = None,
     ) -> str:
-        """Capture a base64 screenshot of the full page or top viewport. Browser rendering is always enabled.
-        :param url: Absolute HTTP or HTTPS URL of the page to process.
-        :param timeout: Page load timeout in seconds, from 1 to 300. The HTTP request allows 30 additional seconds.
-        :param geo_code: Two-letter country code to load the page from, sent in lowercase.
-        :param proxy_country: Two-letter country code of the proxy server, sent in lowercase.
-        :param super: Whether to route the request through real devices.
-        :param wait_until: Navigation completion event to wait for: domcontentloaded, load, networkidle0, or networkidle2.
-        :param proxy: Custom proxy URL used to load the page.
-        :param max_retries: Maximum number of retries, as a nonnegative integer. Omit this parameter for no limit.
-        :param save_result: Whether to save the result to the dashboard Result tab.
-        :param block_resources: Whether to block images, fonts, and stylesheets while loading the page.
-        :param wait_for_selector: Wait for the page to contain the specified CSS selector before returning the result.
-        :param return_cookie: Whether to include browser session cookies in the response.
-        :param screenshot: Screenshot area to capture: full for the entire page or top for the top viewport.
-        :param html: Whether to include the page HTML in the response.
-        :param markdown: Whether to include the page Markdown in the response.
+        """Capture a base64 PNG screenshot of the full page, the top viewport, or a custom viewport size. Browser rendering is always enabled.
+        :param url: URL of the page to scrape. Must include the protocol (https://).
+        :param screenshot: Screenshot area: full captures the entire scroll height (the default), top captures the first viewport, and <width>x<height> sets the viewport size in pixels with an optional -<zoom> percent, such as 1280x800 or 1920x1080-75. Width and height range from 100 to 3840, zoom from 25 to 300. The image is a base64-encoded PNG.
+        :param timeout: Maximum seconds to wait for the scrape before the request times out, from 1 to 330. Increase for slow or complex pages. Defaults to 300.
+        :param geo_code: Two-letter country code to load the page from, such as us or gb. Defaults to the United States.
+        :param wait_for_selector: Waits until a specific CSS selector or text appears on the page before returning it, such as #results. Up to 500 characters. Useful for content that loads asynchronously after the initial page load.
+        :param max_age: Serves a cached result of the same request when it is newer than this age, in milliseconds, such as 86400000 for 1 day. Up to 604800000 (7 days). 0, the default, always scrapes fresh. A cached result costs the same tokens as the original scrape.
+        :param max_retries: Maximum number of retries for the request. Omit for no limit.
         """
-        if screenshot not in ("full", "top"):
-            raise ValueError("screenshot must be full or top")
+        timeout = _integer("timeout", timeout, 1, 330)
         params = {
-            **_page_params(
-                url,
-                timeout,
-                geo_code,
-                proxy_country,
-                super,
-                wait_until,
-                proxy,
-                max_retries,
-                save_result,
-            ),
-            **_loading_params(block_resources, wait_for_selector, return_cookie),
+            "url": _page_url(url),
+            "screenshot": _screenshot(screenshot, default="full"),
+            "timeout": timeout,
+            "geoCode": _country("geo_code", geo_code),
+            "waitForSelector": _text("wait_for_selector", wait_for_selector, 500),
+            "maxAge": _integer("max_age", max_age, 0, MAX_AGE_MS, default=0),
+            "maxRetries": _integer("max_retries", max_retries, 0),
             "browserRendering": True,
-            "screenshot": screenshot,
-            "html": _boolean("html", html),
-            "markdown": _boolean("markdown", markdown),
+            "html": False,
+            "markdown": False,
+            "saveResult": True,
         }
         return await _send(
             self.valves,
             __event_emitter__,
             f"Get Screenshot: {url}",
             _endpoint(params),
-            params["timeout"] + 30,
+            _page_deadline(timeout),
         )
 
     async def scrape_brand(
         self, url: str, __event_emitter__: EventEmitter = None
     ) -> str:
         """Extract a website's colors, typography, logos, and social links as JSON.
-        :param url: Absolute HTTP or HTTPS URL of the page to process.
+        :param url: URL of the page to scrape. Must include the protocol (https://).
         """
         params = {"action": "brand-scraping", "url": _page_url(url), "bundle": "none"}
         return await _send(
@@ -546,61 +504,63 @@ class Tools:
     async def scrape_json(
         self,
         url: str,
-        timeout: int = 300,
-        geo_code: str = "us",
-        proxy_country: str = "us",
-        super: bool = False,
-        wait_until: WaitUntil = "domcontentloaded",
-        proxy: Optional[str] = None,
-        max_retries: Optional[int] = None,
-        save_result: bool = False,
-        prompt: str = DEFAULT_JSON_PROMPT,
-        browser_rendering: bool = False,
-        html: bool = False,
+        prompt: Optional[str] = None,
+        html: bool = True,
         screenshot: bool = False,
+        browser_rendering: Optional[bool] = None,
+        wait_for_selector: Optional[str] = None,
+        warm_start: Optional[bool] = None,
+        block_resources: Optional[bool] = None,
+        timeout: Optional[int] = None,
+        geo_code: Optional[str] = None,
+        max_age: int = 0,
+        max_retries: Optional[int] = None,
         __event_emitter__: EventEmitter = None,
     ) -> str:
         """Extract structured JSON from a page using a natural-language prompt. Append Json Schema: and a JSON schema to shape the output.
-        :param url: Absolute HTTP or HTTPS URL of the page to process.
-        :param timeout: Page load timeout in seconds, from 1 to 300. The HTTP request allows 30 additional seconds.
-        :param geo_code: Two-letter country code to load the page from, sent in lowercase.
-        :param proxy_country: Two-letter country code of the proxy server, sent in lowercase.
-        :param super: Whether to route the request through real devices.
-        :param wait_until: Navigation completion event to wait for: domcontentloaded, load, networkidle0, or networkidle2.
-        :param proxy: Custom proxy URL used to load the page.
-        :param max_retries: Maximum number of retries, as a nonnegative integer. Omit this parameter for no limit.
-        :param save_result: Whether to save the result to the dashboard Result tab.
-        :param prompt: Instructions describing the data to extract. Append Json Schema: and a JSON schema to shape the output.
-        :param browser_rendering: Whether to render the page in a browser before returning the result.
-        :param html: Whether to include the page HTML in the response.
-        :param screenshot: Whether to include a base64 screenshot in the response.
+        :param url: URL of the page to scrape. Must include the protocol (https://).
+        :param prompt: Description of the data shape you want back, for example fields like title, price, and rating. The prompt only parses the scraped content; it cannot instruct the scraper itself. To shape the output with a JSON schema, append it to the prompt as a Json Schema: section. Defaults to "Extract all data as complete as possible."
+        :param html: Returns the raw HTML of the scraped page in the response. On by default; set false to leave it out.
+        :param screenshot: Captures a screenshot of the rendered page as a base64-encoded image. Useful for verifying what the scraper actually saw. Off by default.
+        :param browser_rendering: Controls whether the page is loaded in a browser. Leave it out to load the page without a browser first and switch to a browser automatically if the request is blocked. Set true to always load the page in a browser, which JavaScript-heavy sites, SPAs, and pages that load content dynamically need. Set false to never use a browser.
+        :param wait_for_selector: Waits until a specific CSS selector or text appears on the page before returning it, such as #results. Up to 500 characters. Useful for content that loads asynchronously after the initial page load.
+        :param warm_start: Opens the site's home page first to warm the session before loading the target URL. Useful for sites that expect a normal browsing session before deeper pages.
+        :param block_resources: Blocks images, fonts, and stylesheets from loading. Speeds up scraping and reduces bandwidth usage.
+        :param timeout: Maximum seconds to wait for the scrape before the request times out, from 1 to 330. Increase for slow or complex pages. Defaults to 300.
+        :param geo_code: Two-letter country code to load the page from, such as us or gb. Defaults to the United States.
+        :param max_age: Serves a cached result of the same request when it is newer than this age, in milliseconds, such as 86400000 for 1 day. Up to 604800000 (7 days). 0, the default, always scrapes fresh. A cached result costs the same tokens as the original scrape.
+        :param max_retries: Maximum number of retries for the request. Omit for no limit.
         """
-        _text("prompt", prompt)
+        if prompt is not None:
+            _text("prompt", prompt)  # Validated as non-blank; sent as written.
+        timeout = _integer("timeout", timeout, 1, 330)
         params = {
-            **_page_params(
-                url,
-                timeout,
-                geo_code,
-                proxy_country,
-                super,
-                wait_until,
-                proxy,
-                max_retries,
-                save_result,
-            ),
-            "browserRendering": _boolean("browser_rendering", browser_rendering),
-            "html": _boolean("html", html),
-            "screenshot": _boolean("screenshot", screenshot),
-            "agent": "general",
+            "url": _page_url(url),
             "prompt": prompt,
+            "html": _boolean("html", html, default=True),
+            "screenshot": _boolean("screenshot", screenshot, default=False),
+            "browserRendering": _boolean("browser_rendering", browser_rendering),
+            "waitForSelector": _text("wait_for_selector", wait_for_selector, 500),
+            "warmStart": _boolean("warm_start", warm_start),
+            "blockResources": _boolean("block_resources", block_resources),
+            "timeout": timeout,
+            "geoCode": _country("geo_code", geo_code),
+            "maxAge": _integer("max_age", max_age, 0, MAX_AGE_MS, default=0),
+            "maxRetries": _integer("max_retries", max_retries, 0),
+            "saveResult": True,
+            "agent": "general",
         }
         label = f"Scrape JSON: {url}"
-        deadline = params["timeout"] + 30
+        deadline = _page_deadline(timeout)
         get_url = _endpoint(params)
         if len(get_url) <= MAX_GET_URL_LENGTH:
             return await _send(self.valves, __event_emitter__, label, get_url, deadline)
-        # Too long for GET: url, prompt, and agent move to a POST body; page controls stay in the query.
-        body = {key: params.pop(key) for key in ("url", "prompt", "agent")}
+        # Too long for GET: url, prompt, and agent move to a POST body; the other values stay in the query.
+        body = {
+            key: params.pop(key)
+            for key in ("url", "prompt", "agent")
+            if params[key] is not None
+        }
         return await _send(
             self.valves,
             __event_emitter__,
@@ -614,18 +574,18 @@ class Tools:
     async def web_search(
         self,
         query: str,
-        country: str = "us",
-        num_results: int = 10,
+        country: Optional[str] = None,
+        num_results: Optional[int] = None,
         __event_emitter__: EventEmitter = None,
     ) -> str:
         """Search the web and return ranked results with titles, URLs, descriptions, and sources.
-        :param query: Search query text, trimmed before sending, containing 1 to 1000 characters.
-        :param country: Two-letter country code to search from, sent in lowercase.
-        :param num_results: Number of search results to request, as an integer from 10 to 100. Fewer results may be returned.
+        :param query: The search query, from 1 to 1000 characters.
+        :param country: Two-letter country code to run the search from. Defaults to the United States.
+        :param num_results: How many results to return, from 10 to 100. The search may return fewer. Defaults to 10.
         """
-        query = _text("query", query)
-        if len(query) > 1000:
-            raise ValueError("query must be 1 to 1000 characters")
+        if query is None:
+            raise ValueError("query must be a non-empty string")
+        query = _text("query", query, 1000)
         params = {
             "action": "websearch",
             "query": query,
